@@ -713,6 +713,587 @@ def get_assessment_prompt_v4(language: str = "en-US") -> str:
     return build_assessment_prompt_v4(language)
 
 
+# =============================================================================
+# V5 PROMPT: DEDUCTION-BASED SCORING FOR BETTER DIFFERENTIATION
+# =============================================================================
+# The V2-V4 prompts ask "how good is this?" which leads to clustering toward
+# safe middle scores. V5 inverts this: "start at 100, what's wrong?"
+# This forces explicit error identification and produces wider score distribution.
+
+V5_INSTRUCTION = """You are a strict pronunciation assessor using DEDUCTION-BASED scoring.
+
+CRITICAL INSTRUCTIONS:
+1. Start at 100 points
+2. Listen carefully and identify ALL pronunciation issues
+3. Apply mandatory deductions for each error found
+4. Final score = 100 + total_deductions
+5. Be thorough and use the FULL SCORING RANGE
+
+MANDATORY SCORE DIFFERENTIATION:
+- A native speaker with perfect pronunciation = score 95-100 (rare)
+- A fluent non-native with minimal errors = score 80-90
+- A speaker with noticeable but understandable errors = score 50-65
+- A speaker with heavy accent requiring effort = score 30-45
+- A speaker who is difficult to understand = score 10-25
+
+DO NOT CLUSTER ALL SPEAKERS IN 40-60 RANGE. Listen carefully to distinguish quality levels.
+
+You MUST check EVERY category below and list specific errors found."""
+
+
+V5_DEDUCTION_RUBRIC = """DEDUCTION CATEGORIES (check ALL categories):
+
+## 1. PHONEME ERRORS (max deduction: -25)
+Listen for consonant and vowel pronunciation errors.
+
+Deductions:
+- Consonant substitution (th->d, v->b, r->l, f->p, etc.): -2 each
+- Consonant omission (dropped final consonants): -2 each
+- Vowel quality error (wrong vowel sound): -2 each
+- Consonant cluster simplification: -2 each
+
+Count errors. Poor speakers have 8-12+ errors. Good speakers have 0-3.
+
+## 2. WORD STRESS ERRORS (max deduction: -10)
+Check if syllables are stressed correctly.
+
+Deductions:
+- Wrong syllable stressed: -3 each
+
+Poor speakers stress words incorrectly throughout. Good speakers rarely err.
+
+## 3. FLUENCY ISSUES (max deduction: -15)
+Listen for hesitations, fillers, and pauses.
+
+Deductions:
+- Filler words (um, uh, like, you know): -1 each (max -5)
+- Unnatural pause mid-phrase: -2 each
+- Word-by-word delivery (no connected speech): -8
+- Frequent self-corrections: -3
+
+Poor speakers are halting and choppy. Excellent speakers flow naturally.
+
+## 4. PROSODY/RHYTHM ISSUES (max deduction: -15)
+Check intonation and rhythm patterns.
+
+Deductions:
+- Monotone delivery (no pitch variation): -10
+- Choppy/robotic delivery: -8
+- Unnatural rhythm/timing: -5
+- Wrong sentence intonation: -3
+
+Poor speakers sound robotic. Excellent speakers have natural melody.
+
+## 5. INTELLIGIBILITY IMPACT (max deduction: -20)
+How much effort does a native listener need?
+
+Deductions (choose ONE):
+- Crystal clear, effortless understanding: -0
+- Easily understood with minimal accent: -3
+- Clear but noticeable accent: -6
+- Understandable but requires some attention: -10
+- Understandable with effort, some unclear parts: -14
+- Frequently unclear, requires concentration: -17
+- Very difficult to understand: -20
+
+## 6. OVERALL ACCENT SEVERITY (max deduction: -15)
+How strong is the non-native accent?
+
+Deductions (choose ONE):
+- Native or near-native: -0
+- Very slight accent: -3
+- Noticeable but mild accent: -6
+- Moderate accent, clearly non-native: -9
+- Heavy accent affecting clarity: -12
+- Very heavy accent, significant L1 interference: -15
+
+SCORING RULES:
+- Apply deductions from EACH category
+- Sum all deductions
+- Raw score = 100 + total_deductions
+- ROUND to nearest 5: Final score must be one of: 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100
+- FLOOR: 10 (minimum possible score)
+- CEILING: 100
+
+FINAL SANITY CHECK (MANDATORY):
+After calculating the score, verify it matches the speaker's OVERALL quality:
+- If the speaker is HARD TO UNDERSTAND, score MUST be 10-30 (add more deductions if needed)
+- If the speaker SOUNDS NATIVE, score MUST be 85+ (reduce deductions if needed)
+- If all speakers are getting 40-60, you are not differentiating enough
+
+CALIBRATION GUIDE:
+- Very heavy accent + many errors + hard to understand = score 10-25
+- Heavy accent + several errors + requires effort = score 30-45
+- Moderate accent + some errors + understandable = score 50-60
+- Light accent + minor errors + clear = score 65-80
+- Near-native + rare errors + excellent = score 85-100
+
+EXPECTED DEDUCTION TOTALS:
+- Very poor (10-25): -75 to -90+ deductions
+- Poor (30-45): -55 to -75 deductions
+- Average (50-60): -40 to -55 deductions
+- Good (65-80): -20 to -40 deductions
+- Excellent (85-100): 0 to -15 deductions"""
+
+
+V5_CALIBRATION_EXAMPLES = [
+    {
+        "final_score": 10,
+        "deductions": {
+            "phoneme_errors": {"items": ["th->d (x6)", "v->b (x3)", "dropped consonants (x4)"], "total": -25},
+            "stress_errors": {"items": ["wrong stress (x3)"], "total": -9},
+            "fluency": {"items": ["word-by-word delivery", "many fillers"], "total": -13},
+            "prosody": {"items": ["completely monotone", "robotic"], "total": -15},
+            "intelligibility": {"level": "very difficult to understand", "total": -20},
+            "accent": {"level": "very heavy L1 interference", "total": -15}
+        },
+        "total_deductions": -97,
+        "raw_score": 3,
+        "description": "Very poor speaker. Heavy L1 interference. Word-by-word delivery. Native listener cannot follow most of the speech."
+    },
+    {
+        "final_score": 20,
+        "deductions": {
+            "phoneme_errors": {"items": ["th->d (x5)", "v->b (x2)", "dropped consonants (x3)"], "total": -20},
+            "stress_errors": {"items": ["wrong stress (x2)"], "total": -6},
+            "fluency": {"items": ["very choppy", "fillers (x5)"], "total": -12},
+            "prosody": {"items": ["monotone delivery"], "total": -10},
+            "intelligibility": {"level": "frequently unclear", "total": -17},
+            "accent": {"level": "very heavy accent", "total": -15}
+        },
+        "total_deductions": -80,
+        "raw_score": 20,
+        "description": "Poor speaker. Many phoneme errors. Heavy accent makes understanding difficult. Choppy delivery."
+    },
+    {
+        "final_score": 35,
+        "deductions": {
+            "phoneme_errors": {"items": ["th->d (x4)", "vowel errors (x3)"], "total": -14},
+            "stress_errors": {"items": ["wrong stress (x2)"], "total": -6},
+            "fluency": {"items": ["fillers (x4)", "pauses (x2)"], "total": -8},
+            "prosody": {"items": ["choppy rhythm"], "total": -8},
+            "intelligibility": {"level": "understandable with effort", "total": -14},
+            "accent": {"level": "heavy accent", "total": -12}
+        },
+        "total_deductions": -62,
+        "raw_score": 38,
+        "description": "Below-average speaker. Multiple errors. Heavy accent. Understandable but requires effort."
+    },
+    {
+        "final_score": 50,
+        "deductions": {
+            "phoneme_errors": {"items": ["th->d (x3)", "vowel errors (x2)"], "total": -10},
+            "stress_errors": {"items": ["wrong stress (x1)"], "total": -3},
+            "fluency": {"items": ["fillers (x3)", "pause (x1)"], "total": -5},
+            "prosody": {"items": ["slightly unnatural"], "total": -5},
+            "intelligibility": {"level": "understandable with some attention", "total": -10},
+            "accent": {"level": "moderate accent", "total": -9}
+        },
+        "total_deductions": -42,
+        "raw_score": 58,
+        "description": "Average speaker. Noticeable errors and accent. Understandable but clearly non-native."
+    },
+    {
+        "final_score": 65,
+        "deductions": {
+            "phoneme_errors": {"items": ["th->d (x1)", "vowel errors (x1)"], "total": -4},
+            "stress_errors": {"items": ["none"], "total": 0},
+            "fluency": {"items": ["fillers (x2)"], "total": -2},
+            "prosody": {"items": ["minor rhythm variation"], "total": -3},
+            "intelligibility": {"level": "clear but noticeable accent", "total": -6},
+            "accent": {"level": "noticeable but mild", "total": -6}
+        },
+        "total_deductions": -21,
+        "raw_score": 79,
+        "description": "Above average speaker. Few errors. Mild accent. Clear communication."
+    },
+    {
+        "final_score": 80,
+        "deductions": {
+            "phoneme_errors": {"items": ["minor vowel coloring (x1)"], "total": -2},
+            "stress_errors": {"items": ["none"], "total": 0},
+            "fluency": {"items": ["occasional filler (x1)"], "total": -1},
+            "prosody": {"items": ["natural"], "total": 0},
+            "intelligibility": {"level": "easily understood with minimal accent", "total": -3},
+            "accent": {"level": "very slight accent", "total": -3}
+        },
+        "total_deductions": -9,
+        "raw_score": 91,
+        "description": "Good speaker. Rare minor errors. Very slight accent. Professional communication."
+    },
+    {
+        "final_score": 100,
+        "deductions": {
+            "phoneme_errors": {"items": ["none detected"], "total": 0},
+            "stress_errors": {"items": ["none"], "total": 0},
+            "fluency": {"items": ["perfect flow"], "total": 0},
+            "prosody": {"items": ["natural native-like intonation"], "total": 0},
+            "intelligibility": {"level": "crystal clear", "total": 0},
+            "accent": {"level": "native or near-native", "total": 0}
+        },
+        "total_deductions": 0,
+        "raw_score": 100,
+        "description": "Excellent speaker. Native or near-native. No detectable issues. Broadcast quality."
+    }
+]
+
+
+V5_OUTPUT_SCHEMA = """{
+    "transcription": "full transcription of what was said",
+    "deductions": {
+        "phoneme_errors": {
+            "items": ["specific error descriptions"],
+            "total": <negative number or 0>
+        },
+        "stress_errors": {
+            "items": ["specific errors"],
+            "total": <negative number or 0>
+        },
+        "fluency": {
+            "items": ["specific issues"],
+            "total": <negative number or 0>
+        },
+        "prosody": {
+            "items": ["specific issues"],
+            "total": <negative number or 0>
+        },
+        "intelligibility": {
+            "level": "description of effort needed",
+            "total": <negative number or 0>
+        },
+        "accent": {
+            "level": "severity description",
+            "total": <negative number or 0>
+        }
+    },
+    "total_deductions": <sum of all category totals>,
+    "raw_score": <100 + total_deductions>,
+    "final_score": <MUST be one of: 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95>,
+    "confidence": "low|medium|high",
+    "summary": "one sentence explaining the main issues"
+}"""
+
+
+def format_v5_example(example: dict, index: int) -> str:
+    """Format a single V5 calibration example."""
+    lines = [
+        f"Example {index} - Final Score: {example['final_score']}",
+        f"Situation: {example['description']}",
+        "Deductions applied:"
+    ]
+
+    for category, data in example['deductions'].items():
+        cat_name = category.replace('_', ' ').title()
+        if isinstance(data, dict):
+            items = data.get('items', [])
+            total = data.get('total', 0)
+            level = data.get('level', '')
+            if level:
+                lines.append(f"  - {cat_name}: {level} ({total})")
+            elif items:
+                lines.append(f"  - {cat_name}: {', '.join(items[:3])}... ({total})")
+            else:
+                lines.append(f"  - {cat_name}: none ({total})")
+
+    lines.append(f"Total deductions: {example['total_deductions']}")
+    lines.append(f"Raw score: 100 + ({example['total_deductions']}) = {example['raw_score']}")
+    lines.append(f"Final score (after floor/ceiling): {example['final_score']}")
+
+    return "\n".join(lines)
+
+
+def build_assessment_prompt_v5(language: str = "en-US") -> str:
+    """
+    Build V5 deduction-based pronunciation assessment prompt.
+
+    Key innovation: Inverts the question from "how good is this?" to
+    "start at 100, what's wrong?" This forces explicit error identification
+    and naturally produces wider score distribution.
+
+    Args:
+        language: Target language code (e.g., "en-US", "en-GB")
+
+    Returns:
+        Complete prompt string ready for use with GPT-4o
+    """
+    sorted_examples = sorted(V5_CALIBRATION_EXAMPLES, key=lambda x: x["final_score"])
+
+    prompt_parts = [
+        # 1. Core instruction
+        V5_INSTRUCTION,
+        "",
+        f"Target language: {language}",
+        "",
+
+        # 2. Deduction rubric
+        V5_DEDUCTION_RUBRIC,
+        "",
+
+        # 3. Calibration examples
+        "--- CALIBRATION EXAMPLES (study the deduction patterns) ---",
+        ""
+    ]
+
+    for i, example in enumerate(sorted_examples, 1):
+        prompt_parts.append(format_v5_example(example, i))
+        prompt_parts.append("")
+
+    prompt_parts.extend([
+        "--- END EXAMPLES ---",
+        "",
+
+        # 4. Output format
+        "You MUST respond with valid JSON in this exact format:",
+        V5_OUTPUT_SCHEMA,
+        "",
+
+        # 5. Final reminder
+        "CRITICAL REMINDERS:",
+        "1. Check EVERY deduction category - do not skip any",
+        "2. List SPECIFIC errors found (not generic descriptions)",
+        "3. Calculate raw score: 100 + total_deductions",
+        "4. ROUND final_score to nearest 5: Must be 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, or 95",
+        "5. Score ranges: Poor 15-35, Below-average 40-50, Average 55-65, Good 70-80, Excellent 85-95"
+    ])
+
+    return "\n".join(prompt_parts)
+
+
+def get_assessment_prompt_v5(language: str = "en-US") -> str:
+    """Alias for build_assessment_prompt_v5."""
+    return build_assessment_prompt_v5(language)
+
+
+def get_v5_system_message() -> str:
+    """Get the system message for V5 deduction-based assessment."""
+    return (
+        "You are a strict pronunciation assessor using deduction-based scoring. "
+        "Start at 100 and apply mandatory deductions for each error category. "
+        "Always respond with valid JSON only, no markdown formatting. "
+        "Be thorough in finding errors - missing errors leads to score inflation."
+    )
+
+
+# =============================================================================
+# V6 PROMPT: TWO-STAGE CATEGORIZATION-THEN-SCORING
+# =============================================================================
+# V5 still clusters scores because the model applies similar deductions to all.
+# V6 forces explicit categorization FIRST, then scores within the category.
+
+V6_INSTRUCTION = """You are a pronunciation assessor. Your task is to evaluate the speaker in TWO steps:
+
+STEP 1: CATEGORIZE THE SPEAKER
+Listen to the audio and categorize the speaker into ONE of these 5 categories:
+
+Category A - EXCELLENT (score 85-100):
+- Sounds native or near-native
+- No accent or barely detectable accent
+- Perfect or near-perfect pronunciation
+- Natural fluency with no hesitations
+- Would be mistaken for a native speaker
+
+Category B - GOOD (score 70-84):
+- Very clear pronunciation with rare minor errors
+- Slight accent that doesn't impede communication
+- Natural speech flow
+- Suitable for professional client-facing roles
+
+Category C - AVERAGE (score 50-69):
+- Understandable but clearly non-native
+- Noticeable accent and some pronunciation errors
+- Generally smooth but may have occasional hesitations
+- Typical educated non-native speaker
+
+Category D - BELOW AVERAGE (score 30-49):
+- Requires listener effort to understand
+- Heavy accent with frequent errors
+- Choppy or halting speech
+- Would need training for professional roles
+
+Category E - POOR (score 10-29):
+- Very difficult to understand
+- Very heavy accent
+- Many pronunciation and fluency errors
+- Significant communication barrier
+
+STEP 2: SCORE WITHIN THE CATEGORY
+After categorizing, assign a specific score WITHIN that category's range.
+
+IMPORTANT: You must FIRST decide the category, THEN the score. Do NOT skip to scoring.
+Most non-native speakers fall in categories C, D, or E. Categories A and B are rare."""
+
+
+V6_OUTPUT_SCHEMA = """{
+    "transcription": "full transcription of what was said",
+    "category": "A|B|C|D|E",
+    "category_justification": "why this category was chosen (1-2 sentences)",
+    "score_within_category": "explanation of where within the range (low/mid/high)",
+    "final_score": <number from the category's range, rounded to nearest 5>,
+    "summary": "one sentence overall assessment"
+}"""
+
+
+def build_assessment_prompt_v6(language: str = "en-US") -> str:
+    """
+    Build V6 categorization-then-scoring prompt.
+
+    Key innovation: Forces model to categorize speaker quality FIRST,
+    then score within that category. This prevents all scores clustering
+    in the middle.
+    """
+    return f"""{V6_INSTRUCTION}
+
+Target language: {language}
+
+SCORING GUIDE BY CATEGORY:
+- Category A (EXCELLENT): 85, 90, 95, or 100
+- Category B (GOOD): 70, 75, 80, or 85
+- Category C (AVERAGE): 50, 55, 60, or 65
+- Category D (BELOW AVERAGE): 30, 35, 40, or 45
+- Category E (POOR): 10, 15, 20, or 25
+
+EXAMPLES:
+
+Example 1 - Category E (POOR), Score: 15
+Audio characteristics: Word-by-word delivery, many th->d substitutions, dropped consonants,
+monotone, very heavy accent. Native listener struggles to follow.
+Category justification: Very difficult to understand, significant communication barrier.
+
+Example 2 - Category D (BELOW AVERAGE), Score: 35
+Audio characteristics: Heavy accent, multiple phoneme errors, choppy delivery with pauses,
+understandable with concentration.
+Category justification: Requires effort to understand, would need training.
+
+Example 3 - Category C (AVERAGE), Score: 55
+Audio characteristics: Moderate accent, some phoneme and stress errors, generally smooth
+delivery, understandable.
+Category justification: Clearly non-native but understandable.
+
+Example 4 - Category B (GOOD), Score: 75
+Audio characteristics: Slight accent, rare minor errors, natural flow, easily understood.
+Category justification: Clear speech suitable for professional roles.
+
+Example 5 - Category A (EXCELLENT), Score: 90
+Audio characteristics: Virtually no accent, perfect pronunciation, natural native-like flow.
+Category justification: Would be mistaken for a native speaker.
+
+You MUST respond with valid JSON in this exact format:
+{V6_OUTPUT_SCHEMA}
+
+CRITICAL: First determine the category based on overall quality, then score within that range.
+Do not default to Category C for everyone. Listen carefully to differentiate."""
+
+
+def get_v6_system_message() -> str:
+    """Get the system message for V6 categorization-based assessment."""
+    return (
+        "You are a pronunciation assessor. First categorize the speaker into A/B/C/D/E, "
+        "then score within that category. Most speakers are C, D, or E. "
+        "Categories A and B are rare. Respond with valid JSON only."
+    )
+
+
+# =============================================================================
+# V7 PROMPT: BINARY QUESTIONS APPROACH
+# =============================================================================
+# V5 and V6 both fail because the model defaults to middle ranges.
+# V7 uses a series of binary YES/NO questions to force explicit decisions.
+
+V7_INSTRUCTION = """You are evaluating English pronunciation. Answer each question below with YES or NO, then use your answers to determine the score.
+
+MANDATORY QUESTIONS (answer ALL):
+
+Q1. INTELLIGIBILITY TEST
+Can you understand at least 90% of what the speaker says without re-listening?
+- YES = intelligible | NO = hard to understand
+
+Q2. NATIVE LISTENER EFFORT
+Would a native speaker understand this WITHOUT any concentration or effort?
+- YES = effortless | NO = requires effort
+
+Q3. ACCENT SEVERITY
+Does the speaker have a STRONG accent that immediately stands out?
+- YES = strong accent | NO = mild or no accent
+
+Q4. PHONEME ERRORS
+Do you hear FREQUENT consonant/vowel errors (th->d, v->b, wrong vowels)?
+- YES = many errors | NO = few/no errors
+
+Q5. FLUENCY
+Is the speech smooth and connected, or choppy/halting?
+- SMOOTH = good fluency | CHOPPY = poor fluency
+
+Q6. OVERALL: Could this person work in a US call center without accent training?
+- YES = professional ready | NO = needs training
+
+SCORING BASED ON ANSWERS:
+
+If Q1=NO (unintelligible): Score 10-25
+If Q1=YES but Q2=NO and Q3=YES and Q4=YES: Score 30-45
+If Q1=YES and Q2=mixed and Q3=mixed: Score 50-65
+If Q1=YES and Q2=YES and Q3=NO and Q6=YES: Score 70-85
+If all answers positive (near-native): Score 85-100
+
+BE STRICT: Most non-native speakers score 30-60. Only give 70+ to clearly professional speakers.
+Only give 85+ to speakers who sound native or near-native.
+Give 10-25 to speakers you struggle to understand."""
+
+
+V7_OUTPUT_SCHEMA = """{
+    "transcription": "what the speaker said",
+    "answers": {
+        "q1_intelligible": "YES|NO",
+        "q2_effortless": "YES|NO",
+        "q3_strong_accent": "YES|NO",
+        "q4_many_errors": "YES|NO",
+        "q5_fluency": "SMOOTH|CHOPPY",
+        "q6_professional_ready": "YES|NO"
+    },
+    "score_reasoning": "brief explanation based on answers",
+    "final_score": <score rounded to nearest 5>
+}"""
+
+
+def build_assessment_prompt_v7(language: str = "en-US") -> str:
+    """Build V7 binary questions prompt."""
+    return f"""{V7_INSTRUCTION}
+
+Target language: {language}
+
+SCORING EXAMPLES:
+
+Example 1 - Score: 15
+Answers: Q1=NO, Q2=NO, Q3=YES, Q4=YES, Q5=CHOPPY, Q6=NO
+Reasoning: Cannot understand most of what was said. Heavy accent and errors.
+
+Example 2 - Score: 35
+Answers: Q1=YES, Q2=NO, Q3=YES, Q4=YES, Q5=CHOPPY, Q6=NO
+Reasoning: Understandable but requires effort. Heavy accent and frequent errors.
+
+Example 3 - Score: 55
+Answers: Q1=YES, Q2=NO, Q3=YES, Q4=NO, Q5=SMOOTH, Q6=NO
+Reasoning: Understandable, moderate accent, few errors, smooth delivery.
+
+Example 4 - Score: 75
+Answers: Q1=YES, Q2=YES, Q3=NO, Q4=NO, Q5=SMOOTH, Q6=YES
+Reasoning: Easily understood, mild accent, rare errors, professional quality.
+
+Example 5 - Score: 95
+Answers: Q1=YES, Q2=YES, Q3=NO, Q4=NO, Q5=SMOOTH, Q6=YES
+Reasoning: Native-like pronunciation, no detectable accent.
+
+Respond with valid JSON only:
+{V7_OUTPUT_SCHEMA}"""
+
+
+def get_v7_system_message() -> str:
+    """Get the system message for V7 binary questions assessment."""
+    return (
+        "You are evaluating English pronunciation. Answer YES/NO questions honestly, "
+        "then score based on your answers. Be strict. Respond with valid JSON only."
+    )
+
+
 if __name__ == "__main__":
     # Print the prompt for inspection
     prompt = build_assessment_prompt("en-US")

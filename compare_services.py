@@ -152,6 +152,9 @@ def compare_services(samples: int = 50, prompt_version: str = "v2"):
                     "v2_ratings": v2_ratings,
                     "v2_reasoning": v2_reasoning,
                     "v2_confidence": v2_result.get("confidence", ""),
+                    # V5-specific fields
+                    "deductions": v2_result.get("deductions", {}),
+                    "total_deductions": v2_result.get("total_deductions", 0),
                 }
                 results.append(result)
 
@@ -282,12 +285,20 @@ def generate_report(results: list, failures: list, target_samples: int, prompt_v
     ])
 
     for r in sorted(results, key=lambda x: x["difference"]):
-        ratings_str = "/".join([
-            r["v2_ratings"].get("phoneme_accuracy", "?")[0],
-            r["v2_ratings"].get("rhythm_and_stress", "?")[0],
-            r["v2_ratings"].get("fluency", "?")[0],
-            r["v2_ratings"].get("intelligibility", "?")[0],
-        ]) if r["v2_ratings"] else "N/A"
+        # Handle both V5 deduction format and V2-V4 dimension ratings format
+        if r.get("deductions"):
+            # V5 format - show total deductions
+            total_ded = r.get("total_deductions", 0)
+            ratings_str = f"ded:{total_ded}"
+        elif r["v2_ratings"]:
+            ratings_str = "/".join([
+                r["v2_ratings"].get("phoneme_accuracy", "?")[0],
+                r["v2_ratings"].get("rhythm_and_stress", "?")[0],
+                r["v2_ratings"].get("fluency", "?")[0],
+                r["v2_ratings"].get("intelligibility", "?")[0],
+            ])
+        else:
+            ratings_str = "N/A"
 
         diff_str = f"+{r['difference']:.0f}" if r['difference'] >= 0 else f"{r['difference']:.0f}"
         report_lines.append(f"{r['name'][:35]:<35} {r['existing_score']:>8.0f} {r['v2_score']:>8.0f} {diff_str:>8} {ratings_str}")
@@ -398,7 +409,7 @@ def generate_report(results: list, failures: list, target_samples: int, prompt_v
 def main():
     parser = argparse.ArgumentParser(description='Compare prompt vs existing Video 1 score')
     parser.add_argument('--samples', type=int, default=50, help='Number of samples to compare')
-    parser.add_argument('--prompt', type=str, default='v2', choices=['v2', 'v3', 'v4', 'dspy', 'basic'],
+    parser.add_argument('--prompt', type=str, default='v2', choices=['v2', 'v3', 'v4', 'v5', 'dspy', 'basic'],
                         help='Prompt version to use (default: v2)')
     args = parser.parse_args()
 

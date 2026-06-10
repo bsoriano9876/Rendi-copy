@@ -3,6 +3,7 @@ Configuration settings for the Rendi Pronunciation Assessment System.
 """
 
 import os
+import urllib.parse
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -30,6 +31,13 @@ NEW_SCORE_FIELD = "Pronunciation Assessment Score"
 RENDI_API_KEY = os.getenv("RENDI_API_KEY")
 RENDI_API_URL = "https://api.rendi.dev/v1/run-ffmpeg-command"
 RENDI_STATUS_URL = "https://api.rendi.dev/v1/commands"
+
+# SpeechAce API Configuration
+# Note: API key may be URL-encoded in .env - decode if needed
+_raw_speechace_key = os.getenv("SPEECHACE_API_KEY")
+SPEECHACE_API_KEY = urllib.parse.unquote(_raw_speechace_key) if _raw_speechace_key else None
+SPEECHACE_API_URL = "https://api.speechace.co/api/scoring/speech/v9/json"
+SPEECHACE_DIALECT = os.getenv("SPEECHACE_DIALECT", "en-us")
 
 # Data directories
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")

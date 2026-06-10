@@ -1,0 +1,7 @@
+# Example URLs file for brand_videos.py
+# One URL per line, comments start with #, blank lines are ignored
+
+# Public domain sample videos (short clips for testing)
+# Note: Replace these with your actual video URLs
+
+https://nightowl-bucket.sfo3.digitaloceanspaces.com/xobin/videos/73913_2719688_Pamela_May_Piso.webm

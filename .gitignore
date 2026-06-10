@@ -30,3 +30,7 @@ fluency_scoring/data/
 # Temp files
 *.tmp
 .DS_Store
+
+# Generated brand video artifacts
+brand-videos/.cache/
+brand-videos/output/

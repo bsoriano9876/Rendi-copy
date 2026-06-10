@@ -3,6 +3,7 @@ OpenAI GPT-4o Pronunciation Assessment Module.
 
 Uses OpenAI's multimodal model to assess pronunciation from audio files.
 Supports multiple prompt strategies:
+- v5: Deduction-based scoring (start at 100, deduct for errors) - best differentiation
 - v3: STRICT prompt calibrated to match human evaluator standards (stricter)
 - v2 (default): Anti-compression prompt with chain-of-thought dimension ratings
 - dspy: DSPy-optimized prompt (legacy, causes score compression)
@@ -21,7 +22,14 @@ from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
 
 from ..config import OPENAI_API_KEY
 from ..utils.logging_utils import build_error_result
-from .prompt_builder import build_assessment_prompt, build_assessment_prompt_v3, build_assessment_prompt_v4, get_system_message
+from .prompt_builder import (
+    build_assessment_prompt,
+    build_assessment_prompt_v3,
+    build_assessment_prompt_v4,
+    build_assessment_prompt_v5,
+    get_system_message,
+    get_v5_system_message,
+)
 
 
 MAX_RETRIES = 3
@@ -232,6 +240,9 @@ def assess_pronunciation_openai(
         api_key: OpenAI API key (optional, uses env var if not provided)
         use_optimized_prompt: DEPRECATED - use prompt_version instead
         prompt_version: Which prompt to use:
+            - "v5": Deduction-based scoring (start at 100, deduct for errors)
+            - "v4": 10-point dimension scales for finer granularity
+            - "v3": STRICT prompt calibrated to match human evaluator standards
             - "v2" (default): Anti-compression prompt with chain-of-thought
             - "dspy": Legacy DSPy-optimized prompt (causes score compression)
             - "basic": Simple prompt without few-shot examples
@@ -259,7 +270,21 @@ def assess_pronunciation_openai(
         )
 
     # Get the appropriate prompt based on version
-    if version == "v4":
+    if version == "v7":
+        from src.assessment.prompt_builder import build_assessment_prompt_v7, get_v7_system_message
+        prompt_text = build_assessment_prompt_v7(language)
+        system_msg = get_v7_system_message()
+        logger.info("Using v7 binary questions prompt")
+    elif version == "v6":
+        from src.assessment.prompt_builder import build_assessment_prompt_v6, get_v6_system_message
+        prompt_text = build_assessment_prompt_v6(language)
+        system_msg = get_v6_system_message()
+        logger.info("Using v6 categorization-based prompt")
+    elif version == "v5":
+        prompt_text = build_assessment_prompt_v5(language)
+        system_msg = get_v5_system_message()
+        logger.info("Using v5 deduction-based prompt")
+    elif version == "v4":
         prompt_text = build_assessment_prompt_v4(language)
         system_msg = "You are a pronunciation assessor using 1-10 dimension scales. Always respond with valid JSON only. Rate each dimension carefully using the provided anchors."
         logger.info("Using v4 10-point scale prompt")
@@ -353,10 +378,21 @@ def assess_pronunciation_openai(
 
         result = json.loads(response_text.strip())
 
-        # Calculate final score
-        # v2 format: uses "score" field directly, falls back to averaging "scores" dict
+        # Calculate final score based on prompt version format
+        # V5 format: uses "final_score" from deduction calculation
+        # v2 format: uses "score" field directly
         # Legacy format: averages the "scores" dict
-        if "score" in result and isinstance(result["score"], (int, float)):
+        if "final_score" in result and isinstance(result["final_score"], (int, float)):
+            # V5 or other format with explicit final_score
+            # For V5, ensure score is rounded to nearest 5
+            if version == "v5":
+                raw = result["final_score"]
+                rounded = round(raw / 5) * 5
+                rounded = max(15, min(95, rounded))  # Clamp to valid range
+                result["final_score"] = rounded
+                if raw != rounded:
+                    logger.debug("V5 score rounded: %s -> %s", raw, rounded)
+        elif "score" in result and isinstance(result["score"], (int, float)):
             # v2 format - model provided explicit final score
             result["final_score"] = result["score"]
         else:
@@ -365,6 +401,12 @@ def assess_pronunciation_openai(
             valid_scores = [v for v in scores.values() if isinstance(v, (int, float))]
             if valid_scores:
                 result["final_score"] = sum(valid_scores) / len(valid_scores)
+
+        # Log deduction details if present (V5 format)
+        if "deductions" in result:
+            total_ded = result.get("total_deductions", 0)
+            logger.debug("V5 deductions: total=%d, final_score=%s",
+                        total_ded, result.get("final_score"))
 
         # Log dimension ratings if present (v2 format)
         if "dimension_ratings" in result:
