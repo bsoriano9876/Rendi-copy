@@ -58,7 +58,7 @@ async def run_brand_job(job_id: str, request: ProcessRequest):
         "--segmenter",  "mediapipe",
         "--logo-scale", "0.001",
         "--upscale",    "0"
-    ], capture_output=True, text=True)
+    ], text=True)
 
     branded_url = None
     if proc.returncode == 0:
@@ -79,7 +79,7 @@ async def run_brand_job(job_id: str, request: ProcessRequest):
             "job_id":            job_id,
             "branded_video_url": branded_url,
             "status":            "success" if branded_url else "failed",
-            "error":             proc.stderr if not branded_url else None
+            "error":             "Check Render logs for details" if not branded_url else None
         }, timeout=30)
 
 # ── Upload to DigitalOcean Spaces ─────────────────────────────────────────────
