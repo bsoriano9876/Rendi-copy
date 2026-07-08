@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxrender1 \
     libxext6 \
+    libegl1 \
+    libgles2 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
