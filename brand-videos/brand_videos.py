@@ -433,7 +433,7 @@ def create_segmenter(model_selection: int, segmenter_type: str):
         options = mp_vision.ImageSegmenterOptions(
             base_options=base_options,
             running_mode=mp_vision.RunningMode.IMAGE,
-            output_category_mask=True,
+            output_category_mask=False,
             output_confidence_masks=True
         )
         segmenter = mp_vision.ImageSegmenter.create_from_options(options)
@@ -548,6 +548,8 @@ def process_video(
             try:
                 frame_idx = 0
                 effective_total = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
+                skip_factor = 2  # segment every 2nd frame, reuse mask in between
+                last_mask = None
 
                 while True:
                     ret, frame_bgr = cap.read()
@@ -558,13 +560,15 @@ def process_video(
                     if config.max_frames > 0 and frame_idx >= config.max_frames:
                         break
 
-                    # Convert to RGB for segmentation (at source resolution,
-                    # which the segmentation models are tuned for)
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-                    # Segment
-                    mask = segment_frame(frame_rgb, segmenter_info)
-
+                    if frame_idx % skip_factor == 0 or last_mask is None:
+                        # Convert to RGB for segmentation (at source resolution,
+                        # which the segmentation models are tuned for)
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        mask = segment_frame(frame_rgb, segmenter_info)
+                        last_mask = mask
+                    else:
+                        mask = last_mask
+                        
                     # Upscale frame and mask to output resolution if needed.
                     # Cubic for the image (sharp), linear for the mask (smooth edge).
                     if (out_w, out_h) != (width, height):
