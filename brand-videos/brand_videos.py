@@ -618,7 +618,7 @@ def mux_audio(
             "-map", "1:a:0?",
             "-c:v", "libx264",
             "-crf", "18",
-            "-preset", "medium",
+            "-preset", "veryfast",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
