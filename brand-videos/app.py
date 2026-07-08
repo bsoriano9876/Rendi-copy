@@ -18,6 +18,7 @@ class ProcessRequest(BaseModel):
     video_url:    str
     candidate_id: str
     callback_url: str
+    background:   str = "meeting_dark"
 
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -46,6 +47,7 @@ async def run_brand_job(job_id: str, request: ProcessRequest):
     Path(output_dir).mkdir(exist_ok=True)
 
     script_dir = Path(__file__).parent
+    bg_filename = "Meeting Background 2.png" if request.background == "meeting_light" else "Meeting Background 1.png"
     bg_image   = script_dir / "Meeting Background 1.png"
     logo       = script_dir / "test_logo.png"
 
