@@ -548,7 +548,7 @@ def process_video(
             try:
                 frame_idx = 0
                 effective_total = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
-                skip_factor = 3  # segment every 2nd frame, reuse mask in between
+                skip_factor = 4  # segment every 2nd frame, reuse mask in between
                 last_mask = None
 
                 while True:
@@ -618,7 +618,7 @@ def mux_audio(
             "-map", "1:a:0?",
             "-c:v", "libx264",
             "-crf", "18",
-            "-preset", "veryfast",
+            "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
