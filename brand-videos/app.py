@@ -48,7 +48,7 @@ async def run_brand_job(job_id: str, request: ProcessRequest):
 
     script_dir = Path(__file__).parent
     bg_filename = "Meeting Background 2.png" if request.background == "meeting_light" else "Meeting Background 1.png"
-    bg_image   = script_dir / "Meeting Background 1.png"
+    bg_image   = script_dir / bg_filename
     logo       = script_dir / "test_logo.png"
 
     proc = subprocess.run([
