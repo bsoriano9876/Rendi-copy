@@ -513,11 +513,28 @@ def process_video(
     try:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # cv2.CAP_PROP_FPS is unreliable for browser-recorded WebM (often
+        # variable frame rate), which drifts the silent output video's
+        # duration away from the real audio duration ("fast forward" mouth).
+        # Derive fps from ffprobe's actual duration instead, so
+        # total_frames / fps always matches real playback time.
         fps = cap.get(cv2.CAP_PROP_FPS)
-        # Validate FPS
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+                capture_output=True, text=True, check=True
+            )
+            duration = float(probe.stdout.strip())
+            if duration > 0 and total_frames > 0:
+                fps = total_frames / duration
+        except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+            pass  # fall back to cv2's fps below if ffprobe fails
+
         if not fps or fps <= 0 or fps > 300:
             fps = 30.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         # Resolve output resolution (optional upscale, aspect-preserving)
         out_w, out_h = target_dimensions(width, height, config.upscale)
