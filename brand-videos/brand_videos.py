@@ -520,7 +520,9 @@ def process_video(
         # duration away from the real audio duration ("fast forward" mouth).
         # Derive fps from ffprobe's actual duration instead, so
         # total_frames / fps always matches real playback time.
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        cv2_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = cv2_fps
+        duration = None
         try:
             probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -536,6 +538,8 @@ def process_video(
         if not fps or fps <= 0 or fps > 300:
             fps = 30.0
 
+        print(f"[fps-debug] cv2_fps={cv2_fps} ffprobe_duration={duration} total_frames={total_frames} computed_fps={fps}", flush=True)
+        
         # Resolve output resolution (optional upscale, aspect-preserving)
         out_w, out_h = target_dimensions(width, height, config.upscale)
 
