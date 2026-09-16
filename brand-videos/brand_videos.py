@@ -676,6 +676,20 @@ def process_single_url(url: str, index: int, total: int, config: ProcessingConfi
         video_path = download_video(url, config.cache_dir)
         print(f" done ({video_path.name})")
 
+        normalized_path = video_path.with_name(video_path.stem + "_cfr.mp4")
+        normalize_cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vsync", "cfr", "-r", "30",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-c:a", "aac",
+            str(normalized_path)
+        ]
+        result = subprocess.run(normalize_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            video_path = normalized_path
+        else:
+            print(f"  WARNING: CFR normalization failed, using original file: {result.stderr[:300]}")
+            
         # Determine output filename
         output_name = f"{url_to_filename(url)}{config.output_ext}"
         output_path = config.output_dir / output_name
