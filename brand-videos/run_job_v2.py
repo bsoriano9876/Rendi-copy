@@ -11,6 +11,7 @@ JSON keys
   candidate_id   optional  only used for the default output name
   callback_url   optional  if missing/empty, no callback is sent
   ref            optional  echoed back in the callback (e.g. a queue row id)
+  max_frames     optional  only process the first N frames (quick tests); default = all
   output_bucket  optional  default = DO_SPACES_BUCKET
   output_key     optional  default = moodle_test_center/branded_videos/<candidate_id>_<job_id>.mp4
   output_acl     optional  default = public-read (old behaviour); use "private" to keep it private
@@ -140,6 +141,7 @@ def main() -> int:
         output_key = payload.get("output_key")
         output_acl = payload.get("output_acl", "public-read")
         ref = payload.get("ref")
+        max_frames = int(payload.get("max_frames") or 0)
         if output_key is not None:
             output_key = clean_key(output_key)
     except Exception as e:
@@ -185,7 +187,7 @@ def main() -> int:
                 "--segmenter", "mediapipe",
                 "--logo-scale", "0.001",
                 "--upscale", "0",
-            ],
+            ] + (["--max-frames", str(max_frames)] if max_frames > 0 else []),
             text=True,
             timeout=limit,
         )
@@ -196,7 +198,9 @@ def main() -> int:
             if not mp4_files:
                 error = "No output video was produced"
             else:
+                print(f"Output file: {mp4_files[0].stat().st_size / 1e6:.0f} MB, uploading to {output_bucket}", flush=True)
                 branded_url = upload_to_spaces(mp4_files[0], output_bucket, output_key, output_acl)
+                print("Upload finished", flush=True)
     except subprocess.TimeoutExpired:
         error = f"Timed out after {limit} seconds"
     except Exception as e:
