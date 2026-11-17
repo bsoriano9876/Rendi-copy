@@ -12,6 +12,7 @@ JSON keys
   callback_url   optional  if missing/empty, no callback is sent
   ref            optional  echoed back in the callback (e.g. a queue row id)
   max_frames     optional  only process the first N frames (quick tests); default = all
+  debug_frames   optional  list of frame numbers: save a diagnosis picture for each next to the video
   output_bucket  optional  default = DO_SPACES_BUCKET
   output_key     optional  default = moodle_test_center/branded_videos/<candidate_id>_<job_id>.mp4
   output_acl     optional  default = public-read (old behaviour); use "private" to keep it private
@@ -75,14 +76,14 @@ def processing_limit(duration) -> int:
     return int(min(MAX_PROCESSING_SECONDS, max(MIN_PROCESSING_SECONDS, wanted)))
 
 
-def upload_to_spaces(file_path: Path, bucket: str, key: str, acl: str) -> str:
+def upload_to_spaces(file_path: Path, bucket: str, key: str, acl: str, content_type: str = "video/mp4") -> str:
     s3 = boto3.client(
         "s3",
         endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
         aws_access_key_id=DO_SPACES_KEY,
         aws_secret_access_key=DO_SPACES_SECRET,
     )
-    extra = {"ContentType": "video/mp4"}
+    extra = {"ContentType": content_type}
     if acl and acl != "private":
         extra["ACL"] = acl
     s3.upload_file(str(file_path), bucket, key, ExtraArgs=extra)
@@ -142,6 +143,7 @@ def main() -> int:
         output_acl = payload.get("output_acl", "public-read")
         ref = payload.get("ref")
         max_frames = int(payload.get("max_frames") or 0)
+        debug_frames = [int(x) for x in (payload.get("debug_frames") or [])]
         if output_key is not None:
             output_key = clean_key(output_key)
     except Exception as e:
@@ -175,6 +177,9 @@ def main() -> int:
 
     branded_url = None
     error = None
+    child_env = dict(os.environ)
+    if debug_frames:
+        child_env["BG_DEBUG_FRAMES"] = ",".join(str(x) for x in debug_frames)
     try:
         proc = subprocess.run(
             [
@@ -190,6 +195,7 @@ def main() -> int:
             ] + (["--max-frames", str(max_frames)] if max_frames > 0 else []),
             text=True,
             timeout=limit,
+            env=child_env,
         )
         if proc.returncode != 0:
             error = f"brand_videos.py exited with code {proc.returncode}"
@@ -201,6 +207,13 @@ def main() -> int:
                 print(f"Output file: {mp4_files[0].stat().st_size / 1e6:.0f} MB, uploading to {output_bucket}", flush=True)
                 branded_url = upload_to_spaces(mp4_files[0], output_bucket, output_key, output_acl)
                 print("Upload finished", flush=True)
+                for pic in sorted(output_dir.glob("debug_frame_*.png")):
+                    try:
+                        stem = output_key[:-4] if output_key.lower().endswith(".mp4") else output_key
+                        pic_url = upload_to_spaces(pic, output_bucket, f"{stem}_debug/{pic.name}", output_acl, "image/png")
+                        print(f"Debug picture: {pic_url}", flush=True)
+                    except Exception as e:
+                        print(f"Debug picture upload failed: {e}", flush=True)
     except subprocess.TimeoutExpired:
         error = f"Timed out after {limit} seconds"
     except Exception as e:
