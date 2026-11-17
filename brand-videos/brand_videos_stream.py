@@ -81,8 +81,40 @@ class ProcessingResult:
     error: Optional[str] = None
 
 
-ENCODE_CRF = os.getenv("BG_ENCODE_CRF", "18")
-ENCODE_PRESET = os.getenv("BG_ENCODE_PRESET", "ultrafast")
+ENCODE_CRF = os.getenv("BG_ENCODE_CRF", "23")
+ENCODE_PRESET = os.getenv("BG_ENCODE_PRESET", "veryfast")
+# Caps keep the output small: never above this bitrate, and never above ~1 GB in total.
+ENCODE_MAXRATE_KBPS = int(os.getenv("BG_ENCODE_MAXRATE_KBPS", "5000"))
+ENCODE_MAX_BYTES = int(os.getenv("BG_ENCODE_MAX_BYTES", "1000000000"))
+
+
+def disk_report(label: str) -> None:
+    """Print how much of /tmp is used and by what (Render jobs only have 2 GB of /tmp)."""
+    try:
+        root = Path(tempfile.gettempdir())
+        sizes = {}
+        total = 0
+        for entry in root.iterdir():
+            size = 0
+            if entry.is_dir():
+                for r, _, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            size += os.path.getsize(os.path.join(r, f))
+                        except OSError:
+                            pass
+            else:
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = 0
+            sizes[entry.name] = size
+            total += size
+        top = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top_text = ", ".join(f"{name} {size / 1e6:.0f} MB" for name, size in top)
+        print(f"  [disk] {label}: /tmp total {total / 1e6:.0f} MB; largest: {top_text}", flush=True)
+    except Exception as e:
+        print(f"  [disk] {label}: could not measure ({e})", flush=True)
 
 
 def needs_cfr(path: Path) -> bool:
@@ -598,6 +630,11 @@ def process_video(
         # Pipe finished frames into ONE ffmpeg process that encodes H.264 and adds the
         # source audio. No lossless intermediate file, so disk use stays small.
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        clip_frames = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
+        clip_seconds = max(1.0, clip_frames / fps)
+        maxrate_kbps = int(max(500, min(ENCODE_MAXRATE_KBPS, ENCODE_MAX_BYTES * 8 / 1000 / clip_seconds)))
+        print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps", flush=True)
+        disk_report("before encoding")
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "ffmpeg.log"
             cmd = [
@@ -609,6 +646,9 @@ def process_video(
                 "-map", "0:v:0",
                 "-map", "1:a:0?",
                 "-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+                # accurate RGB->YUV conversion: matches the old FFV1 path (plain bgr24 input shifted colours ~3 levels)
+                "-vf", "scale=flags=accurate_rnd+full_chroma_int+bicubic",
+                "-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{2 * maxrate_kbps}k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 "-c:a", "aac",
                 "-shortest",
@@ -650,6 +690,13 @@ def process_video(
                             break  # ffmpeg stopped; its log explains why (checked below)
 
                         frame_idx += 1
+                        if frame_idx % 500 == 0:
+                            try:
+                                so_far = output_path.stat().st_size if output_path.exists() else 0
+                            except OSError:
+                                so_far = 0
+                            print(f"  [disk] output file so far: {so_far / 1e6:.0f} MB at frame {frame_idx}", flush=True)
+                            disk_report(f"frame {frame_idx}")
                         if progress_callback and effective_total > 0:
                             progress_callback(frame_idx, effective_total)
                 finally:
@@ -666,204 +713,11 @@ def process_video(
             if rc != 0:
                 detail = log_path.read_text(errors="replace")[-1500:] if log_path.exists() else ""
                 raise RuntimeError(f"FFmpeg encode failed (code {rc}): {detail}")
-    finally:
-        cap_src.release()
-        cap_matte.release()
-
-
-def create_segmenter(model_selection: int, segmenter_type: str):
-    """Create the appropriate segmenter based on type."""
-    if segmenter_type == "rembg":
-        if not REMBG_AVAILABLE:
-            raise RuntimeError("rembg not installed. Install with: pip install rembg[cpu]")
-        session = new_session("u2net_human_seg")
-        return ("rembg", session)
-    else:
-        # MediaPipe new Tasks API
-        model_path = get_mediapipe_model_path()
-
-        base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
-        options = mp_vision.ImageSegmenterOptions(
-            base_options=base_options,
-            running_mode=mp_vision.RunningMode.IMAGE,
-            output_category_mask=False,
-            output_confidence_masks=True
-        )
-        segmenter = mp_vision.ImageSegmenter.create_from_options(options)
-        return ("mediapipe", segmenter)
-
-
-def segment_frame(frame_rgb: np.ndarray, segmenter_info: tuple) -> np.ndarray:
-    """Segment a frame, returning a float32 mask in [0, 1] as HxW array."""
-    segmenter_type, segmenter = segmenter_info
-
-    if segmenter_type == "rembg":
-        # rembg returns RGBA image with alpha as mask
-        result = remove(frame_rgb, session=segmenter, only_mask=True)
-        mask = np.array(result, dtype=np.float32) / 255.0
-        # Ensure 2D mask (rembg may return 3D)
-        if mask.ndim == 3:
-            mask = mask[:, :, 0]
-        return mask
-    else:
-        # MediaPipe new Tasks API
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        result = segmenter.segment(mp_image)
-
-        # Prefer the confidence mask: a soft [0,1] probability per pixel that
-        # yields far cleaner edges than the hard category mask. The selfie
-        # segmenter exposes the person channel at index 0.
-        conf = getattr(result, "confidence_masks", None)
-        if conf:
-            mask = np.asarray(conf[0].numpy_view(), dtype=np.float32)
-            # Stretch the mid-confidence band so faint halos drop out while the
-            # body stays solid, keeping a thin feather at the silhouette.
-            mask = np.clip((mask - 0.30) / 0.40, 0.0, 1.0)
-            return mask
-
-        # Fallback: hard category mask (0 = person, 255 = background)
-        category_mask = result.category_mask.numpy_view()
-        mask = (category_mask == 0).astype(np.float32)
-        return mask
-
-
-def composite_frame(
-    frame_bgr: np.ndarray,
-    background: np.ndarray,
-    mask: np.ndarray,
-    edge_softness: int
-) -> np.ndarray:
-    """Composite foreground over background using mask."""
-    # Apply edge softening if requested
-    if edge_softness > 0:
-        kernel_size = edge_softness if edge_softness % 2 == 1 else edge_softness + 1
-        mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), 0)
-
-    # Expand mask dimensions for broadcasting
-    mask_3ch = mask[:, :, np.newaxis]
-
-    # Composite: mask * foreground + (1 - mask) * background
-    composited = (mask_3ch * frame_bgr + (1 - mask_3ch) * background).astype(np.uint8)
-    return composited
-
-
-def process_video(
-    video_path: Path,
-    output_path: Path,
-    config: ProcessingConfig,
-    progress_callback=None
-) -> None:
-    """Process a single video, replacing background."""
-    # Load logo
-    logo_bgra = load_logo(config.logo_path)
-
-    # Open video
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
-
-    segmenter_info = None
-    try:
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # cv2.CAP_PROP_FPS is unreliable for browser-recorded WebM (often
-        # variable frame rate), which drifts the silent output video's
-        # duration away from the real audio duration ("fast forward" mouth).
-        # Derive fps from ffprobe's actual duration instead, so
-        # total_frames / fps always matches real playback time.
-        cv2_fps = cap.get(cv2.CAP_PROP_FPS)
-        fps = cv2_fps
-        duration = None
-        try:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-                capture_output=True, text=True, check=True
-            )
-            duration = float(probe.stdout.strip())
-            if duration > 0 and total_frames > 0:
-                fps = total_frames / duration
-        except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-            pass  # fall back to cv2's fps below if ffprobe fails
-
-        if not fps or fps <= 0 or fps > 300:
-            fps = 30.0
-
-        print(f"[fps-debug] cv2_fps={cv2_fps} ffprobe_duration={duration} total_frames={total_frames} computed_fps={fps}", flush=True)
-        
-        # Resolve output resolution (optional upscale, aspect-preserving)
-        out_w, out_h = target_dimensions(width, height, config.upscale)
-
-        # Create branded background at the OUTPUT resolution so the logo and
-        # solid/image background are rendered crisply rather than upscaled.
-        background = create_branded_background(
-            out_w, out_h, config.bg_color, logo_bgra, config.logo_scale,
-            bg_image_path=config.bg_image_path
-        )
-
-        # Create segmenter
-        segmenter_info = create_segmenter(config.model_selection, config.segmenter)
-
-        # Use context manager for temp directory to ensure cleanup
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Write a lossless intermediate (FFV1) so the final H.264 encode in
-            # mux_audio is the only lossy step. The old mp4v writer baked in
-            # blocking artifacts that -c:v copy then carried straight through.
-            temp_video = Path(temp_dir) / "temp_video.mkv"
-
-            fourcc = cv2.VideoWriter_fourcc(*"FFV1")
-            writer = cv2.VideoWriter(str(temp_video), fourcc, fps, (out_w, out_h))
-
-            if not writer.isOpened():
-                raise RuntimeError("Cannot create video writer")
-
             try:
-                frame_idx = 0
-                effective_total = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
-                skip_factor = 2  # segment every 2nd frame, reuse mask in between
-                last_mask = None
-
-                while True:
-                    ret, frame_bgr = cap.read()
-                    if not ret:
-                        break
-
-                    # Check max_frames limit
-                    if config.max_frames > 0 and frame_idx >= config.max_frames:
-                        break
-
-                    if frame_idx % skip_factor == 0 or last_mask is None:
-                        # Convert to RGB for segmentation (at source resolution,
-                        # which the segmentation models are tuned for)
-                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                        mask = segment_frame(frame_rgb, segmenter_info)
-                        last_mask = mask
-                    else:
-                        mask = last_mask
-                        
-                    # Upscale frame and mask to output resolution if needed.
-                    # Cubic for the image (sharp), linear for the mask (smooth edge).
-                    if (out_w, out_h) != (width, height):
-                        frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-                        mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-                    # Composite
-                    composited = composite_frame(frame_bgr, background, mask, config.edge_softness)
-
-                    # Write frame
-                    writer.write(composited)
-
-                    frame_idx += 1
-                    if progress_callback and effective_total > 0:
-                        progress_callback(frame_idx, effective_total)
-
-            finally:
-                writer.release()
-
-            # Mux audio with FFmpeg (after writer is closed but within temp dir context)
-            mux_audio(video_path, temp_video, output_path, config.output_ext)
+                print(f"  Encode finished: output file {output_path.stat().st_size / 1e6:.0f} MB", flush=True)
+            except OSError:
+                pass
+            disk_report("after encoding")
 
     finally:
         cap.release()
