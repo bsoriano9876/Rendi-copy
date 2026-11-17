@@ -13,6 +13,7 @@ JSON keys
   ref            optional  echoed back in the callback (e.g. a queue row id)
   max_frames     optional  only process the first N frames (quick tests); default = all
   debug_frames   optional  list of frame numbers: save a diagnosis picture for each next to the video
+  segmenter      optional  "rvm" (default: Robust Video Matting, much cleaner) or "mediapipe" (old selfie model)
   output_bucket  optional  default = DO_SPACES_BUCKET
   output_key     optional  default = moodle_test_center/branded_videos/<candidate_id>_<job_id>.mp4
   output_acl     optional  default = public-read (old behaviour); use "private" to keep it private
@@ -41,10 +42,10 @@ import httpx
 
 # --- time limits -------------------------------------------------------------
 # Processing may take TIME_FACTOR seconds per second of video (measured about 4.6x on
-# 720p and about 7x on 1080p), never less than MIN and never more than MAX.
+# 720p and about 7-9x on 1080p, more with the RVM matting model), never less than MIN and never more than MAX.
 MIN_PROCESSING_SECONDS = int(os.getenv("RUN_JOB_MIN_SECONDS", "1200"))
 MAX_PROCESSING_SECONDS = int(os.getenv("RUN_JOB_MAX_SECONDS", "21600"))
-TIME_FACTOR = 10
+TIME_FACTOR = 14
 UNKNOWN_DURATION_SECONDS = 3600
 # Hard stop for the WHOLE script (download, upload and callback included).
 WATCHDOG_EXTRA_SECONDS = int(os.getenv("RUN_JOB_WATCHDOG_EXTRA", "900"))
@@ -53,6 +54,26 @@ DO_SPACES_KEY = os.getenv("DO_SPACES_KEY")
 DO_SPACES_SECRET = os.getenv("DO_SPACES_SECRET")
 DO_SPACES_BUCKET = os.getenv("DO_SPACES_BUCKET", "nightowl-bucket")
 DO_SPACES_REGION = os.getenv("DO_SPACES_REGION", "sfo3")
+
+
+ORT_VERSION = os.getenv("RUN_JOB_ORT_VERSION", "1.20.1")
+
+
+def ensure_onnxruntime(work_dir: Path) -> dict:
+    """RVM needs onnxruntime. Install it for this job only (into the job folder), so the shared
+    image used by the other flows is not touched. Returns extra environment variables."""
+    import importlib.util
+    if importlib.util.find_spec("onnxruntime") is not None:
+        return {}
+    target = work_dir / "pylibs"
+    print(f"Installing onnxruntime {ORT_VERSION} for this job ...", flush=True)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-input", "--no-deps",
+         "--target", str(target), f"onnxruntime=={ORT_VERSION}"],
+        check=True, timeout=300,
+    )
+    old = os.environ.get("PYTHONPATH", "")
+    return {"PYTHONPATH": str(target) + (os.pathsep + old if old else "")}
 
 
 def probe_duration(url: str):
@@ -144,6 +165,7 @@ def main() -> int:
         ref = payload.get("ref")
         max_frames = int(payload.get("max_frames") or 0)
         debug_frames = [int(x) for x in (payload.get("debug_frames") or [])]
+        segmenter = payload.get("segmenter", "rvm")
         if output_key is not None:
             output_key = clean_key(output_key)
     except Exception as e:
@@ -178,9 +200,12 @@ def main() -> int:
     branded_url = None
     error = None
     child_env = dict(os.environ)
+    child_env["BG_SEGMENTER"] = segmenter
     if debug_frames:
         child_env["BG_DEBUG_FRAMES"] = ",".join(str(x) for x in debug_frames)
     try:
+        if segmenter == "rvm":
+            child_env.update(ensure_onnxruntime(work_dir))
         proc = subprocess.run(
             [
                 "python3", str(script_dir / "brand_videos_stream.py"),
