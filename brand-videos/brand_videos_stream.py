@@ -150,37 +150,77 @@ def needs_cfr(path: Path) -> bool:
 MASK_CLEANUP = os.getenv("BG_MASK_CLEANUP", "1") == "1"
 
 
-def refine_mask(mask: np.ndarray) -> np.ndarray:
-    """Clean the person mask: make it near-binary (no half-transparent 'fog'), keep only the
-    main person (drops other participants / thumbnails / specks) and feather the edge.
+class MaskRefiner:
+    """Cleans the person mask frame after frame:
+      * near-binary mask (no half-transparent 'fog');
+      * keeps ONLY the main person (plus pieces right next to them, such as a raised hand);
+      * locks onto where the person was in the previous frame, so thumbnails, other
+        participants or dark areas that the model flags now and then never pop in;
+      * smooths the mask over time so edges do not flicker.
     Works at low resolution, so it costs only a few ms per segmented frame."""
-    h, w = mask.shape[:2]
-    lw = 480
-    lh = max(8, int(round(h * lw / w)))
-    small = cv2.resize(mask.astype(np.float32), (lw, lh), interpolation=cv2.INTER_LINEAR)
-    stretched = np.clip((small - 0.5) / 0.12, 0.0, 1.0)
-    binary = (stretched > 0.5).astype(np.uint8)
-    total = int(binary.sum())
-    if total == 0:
-        return np.zeros((h, w), np.float32)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    if n <= 1:
-        return np.zeros((h, w), np.float32)
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    biggest = int(np.argmax(areas)) + 1
-    keep = np.zeros_like(binary)
-    for i in range(1, n):
-        # the main person, plus big parts of them (for example a raised hand)
-        if i == biggest or stats[i, cv2.CC_STAT_AREA] >= 0.15 * areas.max():
-            keep[labels == i] = 1
-    if int(keep.sum()) < 0.4 * total:
-        # the person looks fragmented: fall back to the original soft mask
-        return np.clip((mask.astype(np.float32) - 0.30) / 0.40, 0.0, 1.0)
-    keep = cv2.erode(keep, np.ones((3, 3), np.uint8))
-    soft = cv2.GaussianBlur(keep.astype(np.float32), (5, 5), 0)
-    return cv2.resize(soft, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    LOW_W = 480
+    GATE = 0.35        # the subject may move this much (relative to its size) between segmentations
+    NEAR = 0.10        # other pieces count as part of the person if their centre is this close to it
+    BLEND_OLD = 0.35   # weight of the previous mask when smoothing over time
+
+    def __init__(self):
+        self.prev_box = None
+        self.prev_soft = None
+        self._open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+
+    @staticmethod
+    def _grow(box, frac, w, h):
+        x0, y0, x1, y1 = box
+        mx, my = (x1 - x0) * frac, (y1 - y0) * frac
+        return (max(0, int(x0 - mx)), max(0, int(y0 - my)), min(w, int(x1 + mx)), min(h, int(y1 + my)))
+
+    def refine(self, mask: np.ndarray) -> np.ndarray:
+        H, W = mask.shape[:2]
+        lw = self.LOW_W
+        lh = max(8, int(round(H * lw / W)))
+        small = cv2.resize(mask.astype(np.float32), (lw, lh), interpolation=cv2.INTER_LINEAR)
+        binary = (np.clip((small - 0.5) / 0.12, 0.0, 1.0) > 0.5).astype(np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self._open)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self._close)
+        n, labels, stats, cents = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+        keep = None
+        if n > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            main = int(np.argmax(areas)) + 1
+            if self.prev_box is not None:
+                gx0, gy0, gx1, gy1 = self._grow(self.prev_box, self.GATE, lw, lh)
+                best_overlap = 0
+                for i in range(1, n):
+                    overlap = int((labels[gy0:gy1, gx0:gx1] == i).sum())
+                    if overlap > best_overlap:
+                        best_overlap, main = overlap, i
+            mx, my, mw, mh = stats[main, 0], stats[main, 1], stats[main, 2], stats[main, 3]
+            nx0, ny0, nx1, ny1 = self._grow((mx, my, mx + mw, my + mh), self.NEAR, lw, lh)
+            keep = np.zeros_like(binary)
+            for i in range(1, n):
+                cx, cy = cents[i]
+                if i == main or (nx0 <= cx <= nx1 and ny0 <= cy <= ny1):
+                    keep[labels == i] = 1
+            if int(keep.sum()) < 0.005 * lw * lh:
+                keep = None
+
+        if keep is None:
+            # no person found in this frame: hold the previous mask (or fall back to the soft mask on the very first frames)
+            if self.prev_soft is not None:
+                return cv2.resize(self.prev_soft, (W, H), interpolation=cv2.INTER_LINEAR)
+            return np.clip((mask.astype(np.float32) - 0.30) / 0.40, 0.0, 1.0)
+
+        ys, xs = np.where(keep > 0)
+        self.prev_box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        keep = cv2.erode(keep, np.ones((3, 3), np.uint8))
+        soft = cv2.GaussianBlur(keep.astype(np.float32), (5, 5), 0)
+        if self.prev_soft is not None and self.prev_soft.shape == soft.shape:
+            soft = (1.0 - self.BLEND_OLD) * soft + self.BLEND_OLD * self.prev_soft
+        self.prev_soft = soft
+        return cv2.resize(soft, (W, H), interpolation=cv2.INTER_LINEAR)
 
 
 def probe_streams(path: Path) -> dict:
@@ -693,6 +733,7 @@ def process_video(
         print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps, mask clean-up {'on' if MASK_CLEANUP else 'off'}", flush=True)
         src_info = probe_streams(video_path)
         print(f"  [streams] source: video {_dur(src_info.get('video', {})):.1f}s, audio {_dur(src_info.get('audio', {})):.1f}s", flush=True)
+        refiner = MaskRefiner() if MASK_CLEANUP else None
         disk_report("before encoding")
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "ffmpeg.log"
@@ -733,8 +774,8 @@ def process_video(
                         if frame_idx % skip_factor == 0 or last_mask is None:
                             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                             mask = segment_frame(frame_rgb, segmenter_info)
-                            if MASK_CLEANUP:
-                                mask = refine_mask(mask)
+                            if refiner is not None:
+                                mask = refiner.refine(mask)
                             last_mask = mask
                         else:
                             mask = last_mask
