@@ -153,7 +153,10 @@ MASK_CLEANUP = os.getenv("BG_MASK_CLEANUP", "1") == "1"
 
 SEGMENTER_CHOICE = os.getenv("BG_SEGMENTER", "rvm")          # "rvm" = Robust Video Matting (default), "mediapipe" = old selfie model
 RVM_STRICT = os.getenv("BG_RVM_STRICT", "1") == "1"          # 1 = fail if RVM cannot start (better than a poor result); 0 = fall back to MediaPipe
-RVM_WIDTH = int(os.getenv("BG_RVM_WIDTH", "640"))            # the model looks at a copy of the frame this wide
+RVM_WIDTH = int(os.getenv("BG_RVM_WIDTH", "384"))            # the model looks at a copy of the frame this wide
+ORT_THREADS = max(1, int(os.getenv("BG_ORT_THREADS", "1")))  # a Render job has 1 CPU; more threads only fight for it
+CV_THREADS = max(1, int(os.getenv("BG_CV_THREADS", "1")))
+cv2.setNumThreads(CV_THREADS)
 RVM_RATIO = float(os.getenv("BG_RVM_RATIO", "0.5"))          # internal downsample ratio of the model
 RVM_EVERY = max(1, int(os.getenv("BG_RVM_EVERY", "2")))      # run the model on every Nth frame, reuse the matte in between
 RVM_FILENAME = "rvm_mobilenetv3_fp32.onnx"
@@ -189,7 +192,11 @@ class RvmMatter:
 
     def __init__(self):
         import onnxruntime as ort
-        self.sess = ort.InferenceSession(str(self._model_path()), providers=["CPUExecutionProvider"])
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = ORT_THREADS
+        opts.inter_op_num_threads = 1
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        self.sess = ort.InferenceSession(str(self._model_path()), sess_options=opts, providers=["CPUExecutionProvider"])
         self.states = [np.zeros((1, 1, 1, 1), np.float32) for _ in range(4)]
         self.ratio = np.array([RVM_RATIO], np.float32)
 
@@ -839,7 +846,7 @@ def process_video(
         print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps, mask clean-up {'on' if MASK_CLEANUP else 'off'}", flush=True)
         src_info = probe_streams(video_path)
         print(f"  [streams] source: video {_dur(src_info.get('video', {})):.1f}s, audio {_dur(src_info.get('audio', {})):.1f}s", flush=True)
-        print("  [version] stream v6: RVM matting (default) + subject-lock fallback + debug pictures", flush=True)
+        print("  [version] stream v7: RVM matting (width %d, %d thread(s)) + timing log" % (RVM_WIDTH, ORT_THREADS), flush=True)
         refiner = MaskRefiner() if (MASK_CLEANUP and matter is None) else None
         raw_mask = None
         disk_report("before encoding")
@@ -853,6 +860,7 @@ def process_video(
                 "-i", str(video_path),
                 "-map", "0:v:0",
                 "-map", "1:a:0?",
+                "-threads", os.getenv("BG_FFMPEG_THREADS", "2"),
                 "-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
                 # accurate RGB->YUV conversion: matches the old FFV1 path (plain bgr24 input shifted colours ~3 levels)
                 "-vf", "scale=flags=accurate_rnd+full_chroma_int+bicubic",
@@ -869,9 +877,13 @@ def process_video(
                     effective_total = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
                     skip_factor = RVM_EVERY if matter is not None else 2  # run the model every Nth frame, reuse the mask in between
                     last_mask = None
+                    tm = {"read": 0.0, "matte": 0.0, "composite": 0.0, "write": 0.0}
+                    tm_frames, tm_calls, tm_start = 0, 0, time.perf_counter()
 
                     while True:
+                        _t = time.perf_counter()
                         ret, frame_bgr = cap.read()
+                        tm["read"] += time.perf_counter() - _t
                         if not ret:
                             break
 
@@ -880,6 +892,8 @@ def process_video(
                             break
 
                         if frame_idx % skip_factor == 0 or last_mask is None:
+                            _t = time.perf_counter()
+                            tm_calls += 1
                             if matter is not None:
                                 mask = matter.matte(frame_bgr)
                                 raw_mask = mask
@@ -889,6 +903,7 @@ def process_video(
                                 raw_mask = mask
                                 if refiner is not None:
                                     mask = refiner.refine(mask)
+                            tm["matte"] += time.perf_counter() - _t
                             last_mask = mask
                         else:
                             mask = last_mask
@@ -897,16 +912,27 @@ def process_video(
                             frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
                             mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
+                        _t = time.perf_counter()
                         composited = composite_frame(frame_bgr, background, mask, config.edge_softness)
+                        tm["composite"] += time.perf_counter() - _t
                         if frame_idx in DEBUG_FRAMES and raw_mask is not None:
                             save_debug_sheet(output_path.parent / f"debug_frame_{frame_idx}.png", frame_bgr, raw_mask, mask, composited)
 
+                        _t = time.perf_counter()
                         try:
                             encoder.stdin.write(np.ascontiguousarray(composited).tobytes())
                         except (BrokenPipeError, OSError):
                             break  # ffmpeg stopped; its log explains why (checked below)
+                        tm["write"] += time.perf_counter() - _t
 
                         frame_idx += 1
+                        tm_frames += 1
+                        if frame_idx % 100 == 0:
+                            wall = time.perf_counter() - tm_start
+                            per = lambda k, n: 1000.0 * tm[k] / max(1, n)
+                            print(f"  [timing] last {tm_frames} frames: {tm_frames / wall:.1f} fps | per frame: read {per('read', tm_frames):.0f} ms, matte {per('matte', tm_frames):.0f} ms ({tm_calls} calls, {per('matte', tm_calls):.0f} ms each), composite {per('composite', tm_frames):.0f} ms, write {per('write', tm_frames):.0f} ms", flush=True)
+                            tm = {k: 0.0 for k in tm}
+                            tm_frames, tm_calls, tm_start = 0, 0, time.perf_counter()
                         if frame_idx % 500 == 0:
                             try:
                                 so_far = output_path.stat().st_size if output_path.exists() else 0
