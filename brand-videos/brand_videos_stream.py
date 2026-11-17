@@ -17,6 +17,7 @@ Downloads videos from URLs, replaces backgrounds with a branded background
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -144,6 +145,65 @@ def needs_cfr(path: Path) -> bool:
         return abs(r - avg) / r > 0.01
     except Exception:
         return True
+
+
+MASK_CLEANUP = os.getenv("BG_MASK_CLEANUP", "1") == "1"
+
+
+def refine_mask(mask: np.ndarray) -> np.ndarray:
+    """Clean the person mask: make it near-binary (no half-transparent 'fog'), keep only the
+    main person (drops other participants / thumbnails / specks) and feather the edge.
+    Works at low resolution, so it costs only a few ms per segmented frame."""
+    h, w = mask.shape[:2]
+    lw = 480
+    lh = max(8, int(round(h * lw / w)))
+    small = cv2.resize(mask.astype(np.float32), (lw, lh), interpolation=cv2.INTER_LINEAR)
+    stretched = np.clip((small - 0.5) / 0.12, 0.0, 1.0)
+    binary = (stretched > 0.5).astype(np.uint8)
+    total = int(binary.sum())
+    if total == 0:
+        return np.zeros((h, w), np.float32)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n <= 1:
+        return np.zeros((h, w), np.float32)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    biggest = int(np.argmax(areas)) + 1
+    keep = np.zeros_like(binary)
+    for i in range(1, n):
+        # the main person, plus big parts of them (for example a raised hand)
+        if i == biggest or stats[i, cv2.CC_STAT_AREA] >= 0.15 * areas.max():
+            keep[labels == i] = 1
+    if int(keep.sum()) < 0.4 * total:
+        # the person looks fragmented: fall back to the original soft mask
+        return np.clip((mask.astype(np.float32) - 0.30) / 0.40, 0.0, 1.0)
+    keep = cv2.erode(keep, np.ones((3, 3), np.uint8))
+    soft = cv2.GaussianBlur(keep.astype(np.float32), (5, 5), 0)
+    return cv2.resize(soft, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def probe_streams(path: Path) -> dict:
+    """Per-stream info (duration, frame count) read with ffprobe; {} if it fails."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration,nb_frames,r_frame_rate",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        info = {}
+        for st in json.loads(out.stdout).get("streams", []):
+            info.setdefault(st.get("codec_type"), st)
+        return info
+    except Exception:
+        return {}
+
+
+def _dur(stream) -> float:
+    try:
+        return float(stream.get("duration"))
+    except Exception:
+        return -1.0
 
 
 def check_dependencies() -> list[str]:
@@ -560,12 +620,9 @@ def composite_frame(
         kernel_size = edge_softness if edge_softness % 2 == 1 else edge_softness + 1
         mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), 0)
 
-    # Expand mask dimensions for broadcasting
-    mask_3ch = mask[:, :, np.newaxis]
-
-    # Composite: mask * foreground + (1 - mask) * background
-    composited = (mask_3ch * frame_bgr + (1 - mask_3ch) * background).astype(np.uint8)
-    return composited
+    # Native blend (about 6x faster than the numpy formula, same result within 1/255)
+    mask = np.ascontiguousarray(mask, dtype=np.float32)
+    return cv2.blendLinear(frame_bgr, background, mask, 1.0 - mask)
 
 
 def process_video(
@@ -633,7 +690,9 @@ def process_video(
         clip_frames = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
         clip_seconds = max(1.0, clip_frames / fps)
         maxrate_kbps = int(max(500, min(ENCODE_MAXRATE_KBPS, ENCODE_MAX_BYTES * 8 / 1000 / clip_seconds)))
-        print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps", flush=True)
+        print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps, mask clean-up {'on' if MASK_CLEANUP else 'off'}", flush=True)
+        src_info = probe_streams(video_path)
+        print(f"  [streams] source: video {_dur(src_info.get('video', {})):.1f}s, audio {_dur(src_info.get('audio', {})):.1f}s", flush=True)
         disk_report("before encoding")
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "ffmpeg.log"
@@ -674,6 +733,8 @@ def process_video(
                         if frame_idx % skip_factor == 0 or last_mask is None:
                             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                             mask = segment_frame(frame_rgb, segmenter_info)
+                            if MASK_CLEANUP:
+                                mask = refine_mask(mask)
                             last_mask = mask
                         else:
                             mask = last_mask
@@ -718,6 +779,14 @@ def process_video(
             except OSError:
                 pass
             disk_report("after encoding")
+            out_info = probe_streams(output_path)
+            ov, oa = out_info.get("video", {}), out_info.get("audio", {})
+            print(f"  [streams] output: video {_dur(ov):.1f}s ({ov.get('nb_frames')} frames, {ov.get('r_frame_rate')}), audio {_dur(oa):.1f}s", flush=True)
+            expected = clip_frames / fps
+            if _dur(ov) > 0 and abs(_dur(ov) - expected) > 0.03 * expected:
+                print(f"  WARNING: output video is {_dur(ov):.1f}s but {clip_frames} frames at {fps:.3f} fps should be {expected:.1f}s", flush=True)
+            if oa and _dur(oa) > 0 and _dur(oa) < 0.9 * _dur(ov):
+                print(f"  WARNING: output audio ({_dur(oa):.1f}s) is shorter than the video ({_dur(ov):.1f}s)", flush=True)
 
     finally:
         cap.release()
