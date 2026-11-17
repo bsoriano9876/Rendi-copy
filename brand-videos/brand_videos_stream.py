@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,6 +149,75 @@ def needs_cfr(path: Path) -> bool:
 
 
 MASK_CLEANUP = os.getenv("BG_MASK_CLEANUP", "1") == "1"
+
+
+SEGMENTER_CHOICE = os.getenv("BG_SEGMENTER", "rvm")          # "rvm" = Robust Video Matting (default), "mediapipe" = old selfie model
+RVM_STRICT = os.getenv("BG_RVM_STRICT", "1") == "1"          # 1 = fail if RVM cannot start (better than a poor result); 0 = fall back to MediaPipe
+RVM_WIDTH = int(os.getenv("BG_RVM_WIDTH", "640"))            # the model looks at a copy of the frame this wide
+RVM_RATIO = float(os.getenv("BG_RVM_RATIO", "0.5"))          # internal downsample ratio of the model
+RVM_EVERY = max(1, int(os.getenv("BG_RVM_EVERY", "2")))      # run the model on every Nth frame, reuse the matte in between
+RVM_FILENAME = "rvm_mobilenetv3_fp32.onnx"
+RVM_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/" + RVM_FILENAME
+
+
+class RvmMatter:
+    """Robust Video Matting (ONNX, CPU): a model made for people in video. Unlike the selfie model it does not
+    treat furniture next to the person, photos of other people or call thumbnails as 'person'."""
+
+    @staticmethod
+    def _model_path() -> Path:
+        beside = Path(__file__).resolve().parent / RVM_FILENAME
+        if beside.exists() and beside.stat().st_size > 10_000_000:
+            return beside
+        cache = Path(tempfile.gettempdir()) / RVM_FILENAME
+        if cache.exists() and cache.stat().st_size > 10_000_000:
+            return cache
+        last = None
+        for attempt in range(1, 4):
+            try:
+                part = cache.with_suffix(".part")
+                with urllib.request.urlopen(RVM_URL, timeout=90) as resp, open(part, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+                if part.stat().st_size < 10_000_000:
+                    raise RuntimeError("downloaded file is too small")
+                part.replace(cache)
+                return cache
+            except Exception as e:  # network hiccup: try again
+                last = e
+                time.sleep(3 * attempt)
+        raise RuntimeError(f"could not download the RVM model: {last}")
+
+    def __init__(self):
+        import onnxruntime as ort
+        self.sess = ort.InferenceSession(str(self._model_path()), providers=["CPUExecutionProvider"])
+        self.states = [np.zeros((1, 1, 1, 1), np.float32) for _ in range(4)]
+        self.ratio = np.array([RVM_RATIO], np.float32)
+
+    @classmethod
+    def create(cls):
+        try:
+            matter = cls()
+            print(f"  Matting: Robust Video Matting (width {RVM_WIDTH}, ratio {RVM_RATIO}, every {RVM_EVERY} frame(s))", flush=True)
+            return matter
+        except Exception as e:
+            if RVM_STRICT:
+                raise RuntimeError(f"RVM matting is not available: {e}")
+            print(f"  WARNING: RVM matting is not available ({e}); using the MediaPipe model instead", flush=True)
+            return None
+
+    def matte(self, frame_bgr: np.ndarray) -> np.ndarray:
+        h, w = frame_bgr.shape[:2]
+        lw = RVM_WIDTH
+        lh = max(8, int(round(h * lw / w)))
+        small = cv2.resize(frame_bgr, (lw, lh), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        src = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
+        fgr, pha, *self.states = self.sess.run(None, {
+            "src": src, "r1i": self.states[0], "r2i": self.states[1],
+            "r3i": self.states[2], "r4i": self.states[3], "downsample_ratio": self.ratio,
+        })
+        alpha = cv2.resize(pha[0, 0], (w, h), interpolation=cv2.INTER_LINEAR)
+        return np.clip((alpha - 0.02) / 0.96, 0.0, 1.0).astype(np.float32)
 
 
 class MaskRefiner:
@@ -755,8 +825,10 @@ def process_video(
             bg_image_path=config.bg_image_path
         )
 
-        # Create segmenter
-        segmenter_info = create_segmenter(config.model_selection, config.segmenter)
+        # Create the matting model (RVM by default); the MediaPipe segmenter is only needed as a fallback
+        matter = RvmMatter.create() if SEGMENTER_CHOICE == "rvm" else None
+        if matter is None:
+            segmenter_info = create_segmenter(config.model_selection, config.segmenter)
 
         # Pipe finished frames into ONE ffmpeg process that encodes H.264 and adds the
         # source audio. No lossless intermediate file, so disk use stays small.
@@ -767,8 +839,8 @@ def process_video(
         print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps, mask clean-up {'on' if MASK_CLEANUP else 'off'}", flush=True)
         src_info = probe_streams(video_path)
         print(f"  [streams] source: video {_dur(src_info.get('video', {})):.1f}s, audio {_dur(src_info.get('audio', {})):.1f}s", flush=True)
-        print("  [version] stream v5: subject-lock mask clean-up + debug pictures", flush=True)
-        refiner = MaskRefiner() if MASK_CLEANUP else None
+        print("  [version] stream v6: RVM matting (default) + subject-lock fallback + debug pictures", flush=True)
+        refiner = MaskRefiner() if (MASK_CLEANUP and matter is None) else None
         raw_mask = None
         disk_report("before encoding")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -795,7 +867,7 @@ def process_video(
                 try:
                     frame_idx = 0
                     effective_total = total_frames if config.max_frames == 0 else min(total_frames, config.max_frames)
-                    skip_factor = 2  # segment every 2nd frame, reuse mask in between
+                    skip_factor = RVM_EVERY if matter is not None else 2  # run the model every Nth frame, reuse the mask in between
                     last_mask = None
 
                     while True:
@@ -808,11 +880,15 @@ def process_video(
                             break
 
                         if frame_idx % skip_factor == 0 or last_mask is None:
-                            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                            mask = segment_frame(frame_rgb, segmenter_info)
-                            raw_mask = mask
-                            if refiner is not None:
-                                mask = refiner.refine(mask)
+                            if matter is not None:
+                                mask = matter.matte(frame_bgr)
+                                raw_mask = mask
+                            else:
+                                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                                mask = segment_frame(frame_rgb, segmenter_info)
+                                raw_mask = mask
+                                if refiner is not None:
+                                    mask = refiner.refine(mask)
                             last_mask = mask
                         else:
                             mask = last_mask
