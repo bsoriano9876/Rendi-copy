@@ -246,6 +246,40 @@ def _dur(stream) -> float:
         return -1.0
 
 
+DEBUG_FRAMES = set(
+    int(x) for x in os.getenv("BG_DEBUG_FRAMES", "").replace(" ", "").split(",") if x.strip().isdigit()
+)
+
+
+def save_debug_sheet(path: Path, frame_bgr, raw_mask, kept_mask, result_bgr) -> None:
+    """2x2 picture for diagnosis: original | result / what the model says (heat map) | what we keep."""
+    try:
+        def fit(img, w=640):
+            h = max(1, int(round(img.shape[0] * w / img.shape[1])))
+            return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+
+        def label(img, text):
+            out = img.copy()
+            cv2.rectangle(out, (0, 0), (out.shape[1], 26), (0, 0, 0), -1)
+            cv2.putText(out, text, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            return out
+
+        size = (frame_bgr.shape[1], frame_bgr.shape[0])
+        raw = cv2.resize(np.clip(raw_mask, 0, 1).astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
+        kept = cv2.resize(np.clip(kept_mask, 0, 1).astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
+        heat = cv2.applyColorMap((raw * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        kept_img = cv2.cvtColor((kept * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        a = label(fit(frame_bgr), "original frame")
+        b = label(fit(result_bgr), "result")
+        c = label(fit(heat), "model: red = sure person, blue = background")
+        d = label(fit(kept_img), "kept after clean-up (white = kept)")
+        sheet = np.vstack([np.hstack([a, b]), np.hstack([c, d])])
+        cv2.imwrite(str(path), sheet)
+        print(f"  [debug] saved {path.name}: model says person for {100 * float((raw > 0.5).mean()):.1f}% of the frame, kept {100 * float((kept > 0.5).mean()):.1f}%", flush=True)
+    except Exception as e:
+        print(f"  [debug] could not save the debug picture: {e}", flush=True)
+
+
 def check_dependencies() -> list[str]:
     """Check that required external tools are available."""
     missing = []
@@ -733,7 +767,9 @@ def process_video(
         print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps, mask clean-up {'on' if MASK_CLEANUP else 'off'}", flush=True)
         src_info = probe_streams(video_path)
         print(f"  [streams] source: video {_dur(src_info.get('video', {})):.1f}s, audio {_dur(src_info.get('audio', {})):.1f}s", flush=True)
+        print("  [version] stream v5: subject-lock mask clean-up + debug pictures", flush=True)
         refiner = MaskRefiner() if MASK_CLEANUP else None
+        raw_mask = None
         disk_report("before encoding")
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "ffmpeg.log"
@@ -774,6 +810,7 @@ def process_video(
                         if frame_idx % skip_factor == 0 or last_mask is None:
                             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                             mask = segment_frame(frame_rgb, segmenter_info)
+                            raw_mask = mask
                             if refiner is not None:
                                 mask = refiner.refine(mask)
                             last_mask = mask
@@ -785,6 +822,8 @@ def process_video(
                             mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
                         composited = composite_frame(frame_bgr, background, mask, config.edge_softness)
+                        if frame_idx in DEBUG_FRAMES and raw_mask is not None:
+                            save_debug_sheet(output_path.parent / f"debug_frame_{frame_idx}.png", frame_bgr, raw_mask, mask, composited)
 
                         try:
                             encoder.stdin.write(np.ascontiguousarray(composited).tobytes())
