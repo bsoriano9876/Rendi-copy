@@ -16,8 +16,9 @@ JSON keys
   output_acl     optional  default = public-read (old behaviour); use "private" to keep it private
 
 Payloads from the existing Airtable and Supabase workflows (video_url,
-candidate_id, background, callback_url) behave exactly as before, except that
-the time limit now scales with the video length.
+candidate_id, background, callback_url) are accepted exactly as before. This script
+uses brand_videos_stream.py (frames are streamed into one ffmpeg encode, so no
+multi-GB temp file) and a time limit that scales with the video length.
 """
 
 import base64
@@ -37,10 +38,10 @@ import boto3
 import httpx
 
 # --- time limits -------------------------------------------------------------
-# Processing may take TIME_FACTOR seconds per second of video (measured about 4.6x
-# on 720p), never less than MIN and never more than MAX.
+# Processing may take TIME_FACTOR seconds per second of video (measured about 4.6x on
+# 720p and about 7x on 1080p), never less than MIN and never more than MAX.
 MIN_PROCESSING_SECONDS = int(os.getenv("RUN_JOB_MIN_SECONDS", "1200"))
-MAX_PROCESSING_SECONDS = int(os.getenv("RUN_JOB_MAX_SECONDS", "10800"))
+MAX_PROCESSING_SECONDS = int(os.getenv("RUN_JOB_MAX_SECONDS", "21600"))
 TIME_FACTOR = 10
 UNKNOWN_DURATION_SECONDS = 3600
 # Hard stop for the WHOLE script (download, upload and callback included).
@@ -175,10 +176,11 @@ def main() -> int:
     try:
         proc = subprocess.run(
             [
-                "python3", str(script_dir / "brand_videos.py"),
+                "python3", str(script_dir / "brand_videos_stream.py"),
                 "--urls", str(urls_file),
                 "--logo", str(script_dir / "test_logo.png"),
                 "--output-dir", str(output_dir),
+                "--cache-dir", str(work_dir / "cache"),
                 "--bg-image", str(script_dir / bg_filename),
                 "--segmenter", "mediapipe",
                 "--logo-scale", "0.001",
