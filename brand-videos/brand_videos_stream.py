@@ -159,6 +159,8 @@ CV_THREADS = max(1, int(os.getenv("BG_CV_THREADS", "1")))
 cv2.setNumThreads(CV_THREADS)
 RVM_RATIO = float(os.getenv("BG_RVM_RATIO", "0.5"))          # internal downsample ratio of the model
 RVM_EVERY = max(1, int(os.getenv("BG_RVM_EVERY", "2")))      # run the model on every Nth frame, reuse the matte in between
+MAX_LONG = int(os.getenv("BG_MAX_LONG", "1920"))             # very large videos (4K and up) are scaled down to at most this long side ...
+MAX_SHORT = int(os.getenv("BG_MAX_SHORT", "1080"))           # ... and this short side. Saves memory; 1080p and smaller are untouched. 0 = never scale.
 RVM_FILENAME = "rvm_mobilenetv3_fp32.onnx"
 RVM_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/" + RVM_FILENAME
 
@@ -502,6 +504,18 @@ def create_branded_background(
     return background
 
 
+def cap_dimensions(src_w: int, src_h: int) -> tuple[int, int]:
+    """Very large videos (4K and up) are processed at no more than MAX_LONG x MAX_SHORT; smaller ones are untouched."""
+    if MAX_LONG <= 0 or MAX_SHORT <= 0 or src_w <= 0 or src_h <= 0:
+        return src_w, src_h
+    long_side, short_side = max(src_w, src_h), min(src_w, src_h)
+    scale = min(1.0, MAX_LONG / long_side, MAX_SHORT / short_side)
+    if scale >= 1.0:
+        return src_w, src_h
+    w, h = int(round(src_w * scale)), int(round(src_h * scale))
+    return w + (w % 2), h + (h % 2)
+
+
 def target_dimensions(src_width: int, src_height: int, upscale: int) -> tuple[int, int]:
     """Compute output (width, height) given an optional target height.
 
@@ -824,6 +838,11 @@ def process_video(
         
         # Resolve output resolution (optional upscale, aspect-preserving)
         out_w, out_h = target_dimensions(width, height, config.upscale)
+        cap_w, cap_h = cap_dimensions(width, height)
+        pre_resize = config.upscale <= 0 and (cap_w, cap_h) != (width, height)
+        if pre_resize:
+            out_w, out_h = cap_w, cap_h
+        print(f"  [resolution] source {width}x{height}" + (f", scaled down to {out_w}x{out_h} before processing (memory)" if pre_resize else ", kept as is"), flush=True)
 
         # Create branded background at the OUTPUT resolution so the logo and
         # solid/image background are rendered crisply rather than upscaled.
@@ -846,7 +865,7 @@ def process_video(
         print(f"  Encoding: crf {ENCODE_CRF}, preset {ENCODE_PRESET}, max {maxrate_kbps} kbps, mask clean-up {'on' if MASK_CLEANUP else 'off'}", flush=True)
         src_info = probe_streams(video_path)
         print(f"  [streams] source: video {_dur(src_info.get('video', {})):.1f}s, audio {_dur(src_info.get('audio', {})):.1f}s", flush=True)
-        print("  [version] stream v7: RVM matting (width %d, %d thread(s)) + timing log" % (RVM_WIDTH, ORT_THREADS), flush=True)
+        print("  [version] stream v8: RVM matting (width %d, %d thread(s)) + timing log + 4K cap" % (RVM_WIDTH, ORT_THREADS), flush=True)
         refiner = MaskRefiner() if (MASK_CLEANUP and matter is None) else None
         raw_mask = None
         disk_report("before encoding")
@@ -891,6 +910,9 @@ def process_video(
                         if config.max_frames > 0 and frame_idx >= config.max_frames:
                             break
 
+                        if pre_resize:
+                            frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
                         if frame_idx % skip_factor == 0 or last_mask is None:
                             _t = time.perf_counter()
                             tm_calls += 1
@@ -908,7 +930,7 @@ def process_video(
                         else:
                             mask = last_mask
 
-                        if (out_w, out_h) != (width, height):
+                        if not pre_resize and (out_w, out_h) != (width, height):
                             frame_bgr = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
                             mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
